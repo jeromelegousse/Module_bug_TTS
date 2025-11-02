@@ -2846,7 +2846,7 @@
   const TTS_SLUG = 'audition-text-to-speech';
   const TTS_TEMPLATE_NAME = 'text-to-speech';
   const TTS_STORAGE_KEY = 'a11y-widget-tts-settings:v1';
-  const TTS_DEFAULTS = { mode: 'selection', volume: 1, rate: 1, voice: '' };
+  const TTS_DEFAULTS = { mode: 'selection', volume: 1, rate: 1, voice: '', continuousRateChange: false };
   const TTS_RATE_PRESETS = [
     { value: 0.25, label: '0.25x' },
     { value: 0.5, label: '0.5x' },
@@ -2899,6 +2899,9 @@
     announce_stopped: '',
     announce_finished: '',
     announce_voice: '',
+    live_rate_label: 'Lecture continue',
+    live_rate_hint: 'Change la vitesse sans relancer la lecture (peut varier selon le navigateur).',
+    live_rate_warning: 'Selon votre navigateur, la vitesse peut ne pas s’actualiser immédiatement en mode lecture continue.',
   };
   const TTS_STATUS_TYPES = ['info', 'playing', 'paused', 'stopped', 'success', 'error'];
   const TTS_STATUS_ICONS = {
@@ -2940,6 +2943,9 @@
   let ttsPendingRateChangeRestart = false;
   let ttsPausedForRateChange = false;
   let ttsRateChangeResumeText = '';
+  let ttsSupportsLiveRateChange = null;
+  let ttsLiveRateChangeProbe = null;
+  let ttsBoundaryCounter = 0;
   let ttsTexts = Object.assign({}, TTS_DEFAULT_TEXTS);
   let ttsStatus = { text: ttsTexts.status_ready, type: 'info' };
   let ttsStopFallbackHandle = null;
@@ -2964,6 +2970,9 @@
       }
       if(typeof parsed.voice === 'string'){
         settings.voice = parsed.voice;
+      }
+      if(Object.prototype.hasOwnProperty.call(parsed, 'continuousRateChange')){
+        settings.continuousRateChange = !!parsed.continuousRateChange;
       }
       return settings;
     } catch(err){
@@ -3035,6 +3044,17 @@
       if(next.voice !== voice){
         next.voice = voice;
         changed = true;
+      }
+    }
+    if(Object.prototype.hasOwnProperty.call(partial, 'continuousRateChange')){
+      const continuous = !!partial.continuousRateChange;
+      if(next.continuousRateChange !== continuous){
+        next.continuousRateChange = continuous;
+        changed = true;
+        if(continuous){
+          ttsPausedForRateChange = false;
+          ttsRateChangeResumeText = '';
+        }
       }
     }
     if(!changed){ return; }
@@ -3130,6 +3150,151 @@
     return hardLimit;
   }
 
+  function getTtsResumeState(){
+    const fullText = typeof ttsFullSourceText === 'string' ? ttsFullSourceText : '';
+    if(!fullText){
+      const fallback = typeof ttsCurrentSourceText === 'string'
+        ? ttsCurrentSourceText
+        : (ttsUtterance && typeof ttsUtterance.text === 'string' ? ttsUtterance.text : '');
+      return { text: fallback || '', offset: 0 };
+    }
+    let chunkIndex = -1;
+    if(ttsLastBoundary && typeof ttsLastBoundary.chunkIndex === 'number'){
+      chunkIndex = ttsLastBoundary.chunkIndex;
+    } else if(typeof ttsQueueIndex === 'number' && ttsQueueIndex >= 0){
+      chunkIndex = ttsQueueIndex;
+    }
+    const boundedIndex = Math.min(Math.max(chunkIndex, 0), Math.max(ttsChunkOffsets.length - 1, 0));
+    const baseOffset = (boundedIndex >= 0 && boundedIndex < ttsChunkOffsets.length)
+      ? (typeof ttsChunkOffsets[boundedIndex] === 'number' ? ttsChunkOffsets[boundedIndex] : 0)
+      : 0;
+    let offset = baseOffset;
+    if(ttsLastBoundary){
+      if(typeof ttsLastBoundary.absolute === 'number'){
+        offset = ttsLastBoundary.absolute;
+      } else if(typeof ttsLastBoundary.charIndex === 'number'){
+        offset = baseOffset + Math.max(0, ttsLastBoundary.charIndex);
+      }
+    }
+    offset = Math.max(0, Math.min(offset, fullText.length));
+    const text = fullText.slice(offset);
+    return { text, offset };
+  }
+
+  function createTtsPendingRestart(state={}, fallbackText){
+    const text = state && typeof state.text === 'string' ? state.text : '';
+    const rawOffset = state && typeof state.offset === 'number' && isFinite(state.offset)
+      ? state.offset
+      : 0;
+    const offset = Math.max(0, Math.floor(rawOffset));
+    const fullText = typeof fallbackText === 'string' && fallbackText
+      ? fallbackText
+      : (typeof ttsFullSourceText === 'string' && ttsFullSourceText ? ttsFullSourceText : text);
+    return { text, offset, fullText };
+  }
+
+  function refineTtsPendingRestartFromAbsoluteOffset(absolute){
+    if(!ttsPendingRestart){ return; }
+    if(typeof absolute !== 'number' || !isFinite(absolute)){ return; }
+    const fullText = typeof ttsPendingRestart.fullText === 'string' ? ttsPendingRestart.fullText : '';
+    if(!fullText){ return; }
+    const previousOffset = typeof ttsPendingRestart.offset === 'number' && isFinite(ttsPendingRestart.offset)
+      ? Math.max(0, Math.floor(ttsPendingRestart.offset))
+      : 0;
+    const bounded = Math.max(previousOffset, Math.min(Math.floor(absolute), fullText.length));
+    if(bounded === previousOffset){ return; }
+    const remainder = fullText.slice(bounded);
+    ttsPendingRestart.offset = bounded;
+    ttsPendingRestart.text = remainder;
+    if(typeof ttsRateChangeResumeText === 'string'){
+      ttsRateChangeResumeText = remainder;
+    }
+    if(!remainder){
+      ttsPendingRestart = null;
+      ttsPendingRateChangeRestart = false;
+    }
+  }
+
+  function updateTtsBoundaryFromEvent(index, event){
+    if(typeof index !== 'number' || index < 0){ return; }
+    const baseOffset = (index >= 0 && index < ttsChunkOffsets.length && typeof ttsChunkOffsets[index] === 'number')
+      ? ttsChunkOffsets[index]
+      : 0;
+    let relative = 0;
+    if(event && typeof event.charIndex === 'number' && event.charIndex >= 0){
+      relative = event.charIndex;
+    } else if(ttsLastBoundary && ttsLastBoundary.chunkIndex === index && typeof ttsLastBoundary.charIndex === 'number'){
+      relative = ttsLastBoundary.charIndex;
+    }
+    relative = Math.max(0, relative);
+    const absolute = Math.max(0, baseOffset + relative);
+    ttsLastBoundary = { charIndex: relative, chunkIndex: index, absolute };
+    if(typeof ttsFullSourceText === 'string' && ttsFullSourceText){
+      ttsCurrentSourceText = ttsFullSourceText.slice(absolute) || '';
+    }
+    refineTtsPendingRestartFromAbsoluteOffset(absolute);
+    return absolute;
+  }
+
+  function clearTtsLiveRateChangeProbe(){
+    if(ttsLiveRateChangeProbe && typeof ttsLiveRateChangeProbe.timerId === 'number'){
+      clearTimeout(ttsLiveRateChangeProbe.timerId);
+    }
+    ttsLiveRateChangeProbe = null;
+  }
+
+  function markTtsLiveRateChangeSuccess(){
+    if(!ttsLiveRateChangeProbe){ return; }
+    clearTtsLiveRateChangeProbe();
+    ttsSupportsLiveRateChange = true;
+  }
+
+  function failTtsLiveRateChangeProbe(){
+    const probe = ttsLiveRateChangeProbe;
+    if(!probe){ return; }
+    clearTtsLiveRateChangeProbe();
+    ttsSupportsLiveRateChange = false;
+    if(ttsSettings.continuousRateChange){ return; }
+    const resumeText = typeof probe.resumeText === 'string' ? probe.resumeText : '';
+    const resumeOffset = typeof probe.resumeOffset === 'number' ? probe.resumeOffset : 0;
+    if(!resumeText){ return; }
+    if(ttsIsPlaying && !ttsIsPaused){
+      restartTtsPlaybackWithCurrentText({ preserveRateChange: true, resumeText, resumeOffset });
+    } else if(ttsIsPaused){
+      ttsRateChangeResumeText = resumeText;
+      ttsPausedForRateChange = true;
+      syncTtsInstances();
+    }
+  }
+
+  function startTtsLiveRateChangeProbe(config={}){
+    if(ttsSettings.continuousRateChange){ return; }
+    const utterance = config && config.utterance ? config.utterance : ttsUtterance;
+    if(!utterance){ return; }
+    const resumeText = config && typeof config.resumeText === 'string' ? config.resumeText : '';
+    const resumeOffset = config && typeof config.resumeOffset === 'number' ? config.resumeOffset : 0;
+    clearTtsLiveRateChangeProbe();
+    const timerId = setTimeout(() => { failTtsLiveRateChangeProbe(); }, 1200);
+    ttsLiveRateChangeProbe = {
+      utterance,
+      startBoundary: ttsBoundaryCounter,
+      resumeText,
+      resumeOffset,
+      timerId,
+    };
+  }
+
+  function applyTtsRateChangeWithoutRestart(resumeText, resumeOffset){
+    if(!ttsSupport || !ttsSynth){ return false; }
+    if(!ttsUtterance){ return false; }
+    try { ttsSynth.resume(); } catch(err){ /* ignore */ }
+    if(ttsSettings.continuousRateChange){ return true; }
+    if(ttsSupportsLiveRateChange === true){ return true; }
+    if(ttsSupportsLiveRateChange === false){ return false; }
+    startTtsLiveRateChangeProbe({ utterance: ttsUtterance, resumeText, resumeOffset });
+    return true;
+  }
+
   function clearTtsStopFallback(){
     if(ttsStopFallbackHandle){
       clearTimeout(ttsStopFallbackHandle.id);
@@ -3173,6 +3338,7 @@
 
   function resetTtsPlaybackState(){
     clearTtsStopFallback();
+    clearTtsLiveRateChangeProbe();
     ttsActiveUtterances.clear();
     ttsUtterance = null;
     ttsIsPlaying = false;
@@ -3185,6 +3351,7 @@
     ttsChunkOffsets = [];
     ttsQueueIndex = -1;
     ttsLastBoundary = null;
+    ttsBoundaryCounter = 0;
     ttsPendingRestart = null;
     ttsPendingRateChangeRestart = false;
     ttsPausedForRateChange = false;
@@ -3442,6 +3609,17 @@
     } else if(instance.rateValue){
       instance.rateValue.textContent = formatTtsRate(rateValue);
     }
+    if(instance.liveRateButton){
+      const liveEnabled = !!ttsSettings.continuousRateChange;
+      instance.liveRateButton.classList.toggle('is-active', liveEnabled);
+      instance.liveRateButton.setAttribute('aria-pressed', liveEnabled ? 'true' : 'false');
+      instance.liveRateButton.disabled = !controlsEnabled;
+    }
+    if(instance.liveRateWarning){
+      const showWarning = !!ttsSettings.continuousRateChange && !!instance.liveRateWarning.textContent;
+      instance.liveRateWarning.hidden = !showWarning;
+      instance.liveRateWarning.setAttribute('aria-hidden', showWarning ? 'false' : 'true');
+    }
     if(instance.voiceSelect){
       instance.voiceSelect.disabled = !controlsEnabled || !ttsVoices.length;
       if(ttsVoices.length){
@@ -3605,7 +3783,20 @@
     if(ttsIsPlaying && !ttsIsPaused){ return; }
     if(ttsIsPaused){
       if(ttsPausedForRateChange){
-        const resumeText = ttsRateChangeResumeText || getTtsResumeText();
+        const state = getTtsResumeState();
+        let resumeText = ttsRateChangeResumeText || (state && typeof state.text === 'string' ? state.text : '');
+        if(!resumeText){
+          resumeText = typeof ttsCurrentSourceText === 'string' ? ttsCurrentSourceText : '';
+        }
+        if(resumeText){
+          const resumeState = Object.assign({}, state, { text: resumeText });
+          const fallbackText = typeof ttsFullSourceText === 'string' ? ttsFullSourceText : resumeText;
+          ttsPendingRestart = createTtsPendingRestart(resumeState, fallbackText);
+          ttsPendingRateChangeRestart = true;
+        } else {
+          ttsPendingRestart = null;
+          ttsPendingRateChangeRestart = false;
+        }
         ttsPausedForRateChange = false;
         ttsRateChangeResumeText = '';
         syncTtsInstances();
@@ -3642,6 +3833,11 @@
     const voice = getTtsVoiceByName(ttsSettings.voice);
     const volume = clampVolume(ttsSettings.volume);
     const rate = clampRate(ttsSettings.rate);
+    if(ttsSupportsLiveRateChange === false && !ttsSettings.continuousRateChange){
+      ttsSupportsLiveRateChange = null;
+    }
+    clearTtsLiveRateChangeProbe();
+    ttsBoundaryCounter = 0;
     ttsChunkQueue = chunkData.chunks.slice();
     ttsChunkOffsets = chunkData.offsets.slice();
     ttsFullSourceText = chunkData.text;
@@ -3672,20 +3868,22 @@
         ttsIsPaused = false;
         ttsIsStopping = false;
         ttsSuppressStopStatus = false;
-        ttsLastBoundary = { charIndex: 0 };
         const offset = typeof ttsChunkOffsets[index] === 'number' ? ttsChunkOffsets[index] : 0;
         ttsCurrentSourceText = ttsFullSourceText.slice(offset) || chunk;
+        ttsLastBoundary = { charIndex: 0, chunkIndex: index, absolute: offset };
         updateTtsStatus(ttsTexts.status_playing || TTS_DEFAULT_TEXTS.status_playing, 'playing');
         if(index === 0 && ttsTexts.announce_started){ ttsAnnounce(ttsTexts.announce_started); }
       };
-      utterance.onpause = () => {
+      utterance.onpause = event => {
         if(ttsUtterance !== utterance){ return; }
+        updateTtsBoundaryFromEvent(index, event);
         ttsIsPaused = true;
         updateTtsStatus(ttsTexts.status_paused || TTS_DEFAULT_TEXTS.status_paused, 'paused');
         if(ttsTexts.announce_paused){ ttsAnnounce(ttsTexts.announce_paused); }
       };
-      utterance.onresume = () => {
+      utterance.onresume = event => {
         if(ttsUtterance !== utterance){ return; }
+        updateTtsBoundaryFromEvent(index, event);
         ttsIsPaused = false;
         ttsPausedForRateChange = false;
         updateTtsStatus(ttsTexts.status_playing || TTS_DEFAULT_TEXTS.status_playing, 'playing');
@@ -3693,12 +3891,26 @@
       };
       utterance.onboundary = event => {
         if(ttsUtterance !== utterance){ return; }
-        if(event && typeof event.charIndex === 'number' && event.charIndex >= 0){
-          ttsLastBoundary = { charIndex: event.charIndex };
+        updateTtsBoundaryFromEvent(index, event);
+        ttsBoundaryCounter += 1;
+        if(ttsLiveRateChangeProbe && ttsLiveRateChangeProbe.utterance === utterance){
+          if(ttsBoundaryCounter > ttsLiveRateChangeProbe.startBoundary){
+            markTtsLiveRateChangeSuccess();
+          }
         }
       };
-      utterance.onend = () => { handleTtsChunkEnd(utterance, index); };
-      utterance.onerror = event => { handleTtsChunkError(event); };
+      utterance.onend = event => {
+        if(ttsUtterance === utterance){
+          updateTtsBoundaryFromEvent(index, event);
+        }
+        handleTtsChunkEnd(utterance, index, event);
+      };
+      utterance.onerror = event => {
+        if(ttsUtterance === utterance){
+          updateTtsBoundaryFromEvent(index, event);
+        }
+        handleTtsChunkError(event);
+      };
       return utterance;
     });
     try {
@@ -3711,9 +3923,12 @@
     }
   }
 
-  function handleTtsChunkEnd(utterance, index){
+  function handleTtsChunkEnd(utterance, index, _event){
     clearTtsStopFallback();
     ttsActiveUtterances.delete(utterance);
+    if(ttsLiveRateChangeProbe && ttsLiveRateChangeProbe.utterance === utterance){
+      markTtsLiveRateChangeSuccess();
+    }
     if(ttsUtterance === utterance){
       const nextIndex = index + 1;
       if(nextIndex < ttsChunkOffsets.length){
@@ -3775,6 +3990,7 @@
   function ttsStop(options={}){
     if(!ttsSupport || !ttsSynth){ return; }
     clearTtsStopFallback();
+    clearTtsLiveRateChangeProbe();
     if(options.silent === true){
       // keep pending restart when stopping silently
     } else {
@@ -3801,22 +4017,26 @@
   }
 
   function getTtsResumeText(){
-    const source = (ttsCurrentSourceText && typeof ttsCurrentSourceText === 'string')
-      ? ttsCurrentSourceText
-      : (ttsUtterance && typeof ttsUtterance.text === 'string' ? ttsUtterance.text : '');
-    if(!source){ return ''; }
-    const boundaryIndex = ttsLastBoundary && typeof ttsLastBoundary.charIndex === 'number' ? ttsLastBoundary.charIndex : 0;
-    if(boundaryIndex > 0 && boundaryIndex < source.length){
-      const slice = source.slice(boundaryIndex);
-      return slice || source;
-    }
-    return source;
+    const state = getTtsResumeState();
+    return state && typeof state.text === 'string' ? state.text : '';
   }
 
   function restartTtsPlaybackWithCurrentText(options={}){
     if(!ttsUtterance || !ttsIsPlaying || ttsIsPaused){ return; }
+    clearTtsLiveRateChangeProbe();
     const override = options && typeof options.resumeText === 'string' ? options.resumeText : '';
-    const resumeText = override || ttsRateChangeResumeText || getTtsResumeText();
+    const state = getTtsResumeState();
+    let resumeText = state && typeof state.text === 'string' ? state.text : '';
+    let resumeOffset = state && typeof state.offset === 'number' && isFinite(state.offset) ? state.offset : 0;
+    if(!resumeText && override){
+      resumeText = override;
+      if(typeof options.resumeOffset === 'number' && isFinite(options.resumeOffset)){
+        resumeOffset = options.resumeOffset;
+      }
+    }
+    if(!resumeText && ttsRateChangeResumeText){
+      resumeText = ttsRateChangeResumeText;
+    }
     if(!resumeText){ return; }
     const preserveRateChange = options && options.preserveRateChange === true;
     if(preserveRateChange){
@@ -3826,7 +4046,8 @@
       ttsPausedForRateChange = false;
       ttsRateChangeResumeText = '';
     }
-    ttsPendingRestart = { text: resumeText };
+    const fallbackText = typeof ttsFullSourceText === 'string' ? ttsFullSourceText : resumeText;
+    ttsPendingRestart = createTtsPendingRestart({ text: resumeText, offset: resumeOffset }, fallbackText);
     ttsPendingRateChangeRestart = preserveRateChange === true;
     if(preserveRateChange){ syncTtsInstances(); }
     if(ttsIsStopping){
@@ -4189,6 +4410,30 @@
       });
     });
 
+    const liveRateButton = document.createElement('button');
+    liveRateButton.type = 'button';
+    liveRateButton.className = 'a11y-tts__rate-option a11y-tts__rate-option--continuous';
+    liveRateButton.textContent = instanceTexts.live_rate_label || 'Lecture continue';
+    liveRateButton.setAttribute('aria-pressed', 'false');
+    rateOptionsContainer.appendChild(liveRateButton);
+
+    if(instanceTexts.live_rate_hint){
+      const liveRateHint = document.createElement('p');
+      liveRateHint.className = 'a11y-tts__hint';
+      liveRateHint.textContent = instanceTexts.live_rate_hint;
+      rateGroup.appendChild(liveRateHint);
+    }
+
+    const liveRateWarning = document.createElement('p');
+    liveRateWarning.className = 'a11y-tts__info a11y-tts__info--muted';
+    liveRateWarning.id = `${baseId}-rate-live-warning`;
+    liveRateWarning.textContent = instanceTexts.live_rate_warning || '';
+    liveRateWarning.hidden = true;
+    liveRateWarning.setAttribute('aria-hidden', 'true');
+    rateGroup.appendChild(liveRateWarning);
+
+    liveRateButton.setAttribute('aria-describedby', liveRateWarning.id);
+
     const voiceGroup = document.createElement('div');
     voiceGroup.className = 'a11y-tts__group';
     body.appendChild(voiceGroup);
@@ -4247,6 +4492,8 @@
       volumePlus,
       rateValue,
       rateOptions: rateOptionButtons,
+      liveRateButton: liveRateButton,
+      liveRateWarning,
       voiceSelect,
       voiceInfo,
       wasConnected: false,
@@ -4306,28 +4553,66 @@
         ttsUtterance.rate = rate;
       }
 
+      const resumeState = getTtsResumeState();
+      const resumeText = resumeState && typeof resumeState.text === 'string' ? resumeState.text : '';
+      const resumeOffset = resumeState && typeof resumeState.offset === 'number' ? resumeState.offset : 0;
       const synthPaused = !!(ttsSynth && ttsSynth.paused);
-      const resumeText = getTtsResumeText();
-      if(ttsIsPaused || synthPaused){
-        ttsRateChangeResumeText = resumeText || '';
-        ttsPausedForRateChange = true;
-        syncTtsInstances();
-      }
+      const canLiveUpdate = ttsSettings.continuousRateChange || ttsSupportsLiveRateChange === true;
+      const hasResumeText = !!resumeText;
+
+      ttsRateChangeResumeText = resumeText;
 
       if(ttsIsPlaying && !ttsIsPaused){
-        const restartText = resumeText || ttsRateChangeResumeText || '';
-        ttsRateChangeResumeText = restartText;
-        ttsPausedForRateChange = true;
+        if(!canLiveUpdate && hasResumeText){
+          ttsPausedForRateChange = true;
+          syncTtsInstances();
+          restartTtsPlaybackWithCurrentText({
+            preserveRateChange: true,
+            resumeText,
+            resumeOffset,
+          });
+          return;
+        }
+        const applied = canLiveUpdate ? applyTtsRateChangeWithoutRestart(resumeText, resumeOffset) : false;
+        if(!applied && hasResumeText && !ttsSettings.continuousRateChange){
+          ttsSupportsLiveRateChange = false;
+          ttsPausedForRateChange = true;
+          syncTtsInstances();
+          restartTtsPlaybackWithCurrentText({
+            preserveRateChange: true,
+            resumeText,
+            resumeOffset,
+          });
+          return;
+        }
+        ttsPausedForRateChange = false;
+        ttsRateChangeResumeText = '';
         syncTtsInstances();
-        restartTtsPlaybackWithCurrentText({
-          resumeText: restartText,
-          preserveRateChange: true,
-        });
+        return;
       }
+
+      if(ttsIsPaused || synthPaused){
+        const shouldFlagPause = !canLiveUpdate && hasResumeText;
+        ttsPausedForRateChange = shouldFlagPause;
+        if(!shouldFlagPause){
+          ttsRateChangeResumeText = '';
+        }
+        syncTtsInstances();
+        return;
+      }
+
+      ttsPausedForRateChange = false;
+      ttsRateChangeResumeText = '';
+      syncTtsInstances();
     };
 
     rateOptionButtons.forEach(option => {
       option.button.addEventListener('click', () => selectRate(option.value));
+    });
+
+    liveRateButton.addEventListener('click', () => {
+      const next = !ttsSettings.continuousRateChange;
+      updateTtsSettings({ continuousRateChange: next });
     });
 
     voiceSelect.addEventListener('change', () => {
