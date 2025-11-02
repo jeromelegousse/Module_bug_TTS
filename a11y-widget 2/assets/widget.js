@@ -4469,19 +4469,14 @@
       const resumeState = getTtsResumeState();
       const resumeText = resumeState && typeof resumeState.text === 'string' ? resumeState.text : '';
       const synthPaused = !!(ttsSynth && ttsSynth.paused);
-      const forceRestart = !ttsSettings.continuousRateChange && ttsSupportsLiveRateChange === false;
-      let shouldFlagPause = false;
+      const canLiveUpdate = ttsSettings.continuousRateChange || ttsSupportsLiveRateChange === true;
+      const hasResumeText = !!resumeText;
 
       ttsRateChangeResumeText = resumeText;
 
-      if(ttsIsPaused || synthPaused){
-        shouldFlagPause = forceRestart && !!resumeText;
-      }
-
       if(ttsIsPlaying && !ttsIsPaused){
-        if(forceRestart && resumeText){
-          shouldFlagPause = true;
-          ttsPausedForRateChange = shouldFlagPause;
+        if(!canLiveUpdate && hasResumeText){
+          ttsPausedForRateChange = true;
           syncTtsInstances();
           restartTtsPlaybackWithCurrentText({
             preserveRateChange: true,
@@ -4489,10 +4484,10 @@
           });
           return;
         }
-        const applied = applyTtsRateChangeWithoutRestart(resumeText);
-        if(!applied && resumeText && !ttsSettings.continuousRateChange){
-          shouldFlagPause = true;
-          ttsPausedForRateChange = shouldFlagPause;
+        const applied = canLiveUpdate ? applyTtsRateChangeWithoutRestart(resumeText) : false;
+        if(!applied && hasResumeText && !ttsSettings.continuousRateChange){
+          ttsSupportsLiveRateChange = false;
+          ttsPausedForRateChange = true;
           syncTtsInstances();
           restartTtsPlaybackWithCurrentText({
             preserveRateChange: true,
@@ -4500,10 +4495,24 @@
           });
           return;
         }
-        shouldFlagPause = false;
+        ttsPausedForRateChange = false;
+        ttsRateChangeResumeText = '';
+        syncTtsInstances();
+        return;
       }
 
-      ttsPausedForRateChange = shouldFlagPause && !!resumeText;
+      if(ttsIsPaused || synthPaused){
+        const shouldFlagPause = !canLiveUpdate && hasResumeText;
+        ttsPausedForRateChange = shouldFlagPause;
+        if(!shouldFlagPause){
+          ttsRateChangeResumeText = '';
+        }
+        syncTtsInstances();
+        return;
+      }
+
+      ttsPausedForRateChange = false;
+      ttsRateChangeResumeText = '';
       syncTtsInstances();
     };
 
