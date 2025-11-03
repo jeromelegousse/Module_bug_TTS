@@ -3254,7 +3254,6 @@
     if(!probe){ return; }
     clearTtsLiveRateChangeProbe();
     ttsSupportsLiveRateChange = false;
-    if(ttsSettings.continuousRateChange){ return; }
     const resumeText = typeof probe.resumeText === 'string' ? probe.resumeText : '';
     const resumeOffset = typeof probe.resumeOffset === 'number' ? probe.resumeOffset : 0;
     if(!resumeText){ return; }
@@ -3268,7 +3267,6 @@
   }
 
   function startTtsLiveRateChangeProbe(config={}){
-    if(ttsSettings.continuousRateChange){ return; }
     const utterance = config && config.utterance ? config.utterance : ttsUtterance;
     if(!utterance){ return; }
     const resumeText = config && typeof config.resumeText === 'string' ? config.resumeText : '';
@@ -3288,7 +3286,6 @@
     if(!ttsSupport || !ttsSynth){ return false; }
     if(!ttsUtterance){ return false; }
     try { ttsSynth.resume(); } catch(err){ /* ignore */ }
-    if(ttsSettings.continuousRateChange){ return true; }
     if(ttsSupportsLiveRateChange === true){ return true; }
     if(ttsSupportsLiveRateChange === false){ return false; }
     startTtsLiveRateChangeProbe({ utterance: ttsUtterance, resumeText, resumeOffset });
@@ -4557,7 +4554,9 @@
       const resumeText = resumeState && typeof resumeState.text === 'string' ? resumeState.text : '';
       const resumeOffset = resumeState && typeof resumeState.offset === 'number' ? resumeState.offset : 0;
       const synthPaused = !!(ttsSynth && ttsSynth.paused);
-      const canLiveUpdate = ttsSettings.continuousRateChange || ttsSupportsLiveRateChange === true;
+      const canLiveUpdate = ttsSettings.continuousRateChange
+        ? ttsSupportsLiveRateChange !== false
+        : ttsSupportsLiveRateChange === true;
       const hasResumeText = !!resumeText;
 
       ttsRateChangeResumeText = resumeText;
@@ -4574,7 +4573,7 @@
           return;
         }
         const applied = canLiveUpdate ? applyTtsRateChangeWithoutRestart(resumeText, resumeOffset) : false;
-        if(!applied && hasResumeText && !ttsSettings.continuousRateChange){
+        if(!applied && hasResumeText){
           ttsSupportsLiveRateChange = false;
           ttsPausedForRateChange = true;
           syncTtsInstances();
